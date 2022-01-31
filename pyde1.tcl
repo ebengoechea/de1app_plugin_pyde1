@@ -7,8 +7,8 @@
 ### By Enrique Bengoechea <enri.bengoechea@gmail.com> 
 ########################################################################################################################
 #set ::skindebug 1
-plugins enable pyde1
-fconfigure $::logging::_log_fh -buffering line
+#plugins enable pyde1
+#fconfigure $::logging::_log_fh -buffering line
 #dui config debug_buttons 1
 
 package require http
@@ -128,7 +128,7 @@ proc ::plugins::pyde1::rest { endpoint {query {}} {config {}} {body {}} } {
 	} on error err {
 		msg -WARNING [namespace current] rest: "Error on REST request $url: $err"
 		dui say [translate "Request to pyDE1 failed"]
-		message_page "Error on REST request $url: $err" [translate Ok]
+		#message_page "Error on REST request $url: $err" [translate Ok]
 	}
 	
 	msg -INFO [namespace current] rest: "$url => $response"
@@ -161,7 +161,7 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 		msg -ERROR [namespace current] request: "Can't register $settings(hostname):$settings(port) - $err: $err"
 		dui say [translate "Request to pyDE1 failed"]
 		
-		message_page "Can't register $settings(hostname):$settings(port) - $err" [translate Ok]
+		#message_page "Can't register $settings(hostname):$settings(port) - $err" [translate Ok]
 		return
 	}
 	
@@ -182,7 +182,7 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 		dui say [translate "Request to pyDE1 failed"]
 		catch { ::http::cleanup $token }
 		
-		message_page "Could not $method $url: $err" [translate Ok]
+		#message_page "Could not $method $url: $err" [translate Ok]
 	}
 	
 	if { $status eq "ok" && $ncode == 200 } {
@@ -192,80 +192,11 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 			msg -WARNING [namespace current] request: "Can't parse JSON answer: $my_err\n$answer"
 			dui say [translate "Request to pyDE1 failed"]
 			
-			message_page "Can't parse JSON answer: $err" [translate Ok]
+			#message_page "Can't parse JSON answer: $err" [translate Ok]
 		}
 	}
 		
 	msg -INFO [namespace current] request: "$url $method => ncode=$ncode, status=$status\n$response"
-	return $response
-}
-
-proc ::plugins::pyde1::patch { endpoint data } {
-	variable settings
-}
-
-proc ::plugins::pyde1::put { endpoint query } {
-	variable settings
-	if { $endpoint eq "" } {
-		msg -WARN [namespace current] get: "'endpoint' not specified"
-		return
-	}	
-	
-	if { [string is true $settings(use_https)] } {
-		set url "https://"
-	} else {
-		set url "http://"
-	}
-	append url "$settings(hostname):$settings(port)/$endpoint"
-	
-	try {
-		#::http::register https 443 [::tls::socket $settings(hostname) $settings(port)]
-		::http::register https 443 ::tls::socket
-	} on error err {
-		message_page "Can't register $settings(hostname):$settings(port) - $err" [translate Ok]
-		return
-	}
-	
-	set status ""
-	set answer ""
-	set code ""
-	set ncode ""
-	set response ""
-	try {
-		# application/x-www-form-urlencoded
-		# -headers [list Content-Length [string length $query]]
-		set token [::http::geturl $url -method PUT -type "application/json" -query "$query" -timeout 10000]
-		set status [::http::status $token]
-		set answer [::http::data $token]
-		set ncode [::http::ncode $token]
-		set code [::http::code $token]
-	} on error err {
-		msg -WARNING [namespace current] put: "Could not put to $url: $err"
-		dui say [translate "Request to pyDE1 failed"]
-		catch { ::http::cleanup $token }
-		
-		message_page "Could not put to $url: $err" [translate Ok]
-	}
-	
-	try {
-		::http::cleanup $token
-	}
-
-	
-	if { $status eq "ok" && $ncode == 200 } {
-		try {
-			set response [::json::json2dict $answer]
-		} on error err {
-			msg -WARNING [namespace current] put: "Can't parse JSON answer: $my_err\n$answer"
-			dui say [translate "Request to pyDE1 failed"]
-			
-			message_page "Can't parse JSON answer: $err" [translate Ok]
-		}
-	} else {
-		msg -INFO [namespace current] put: "$url => ncode=$ncode, status=$status\n$response,\nanswer=$answer"
-	}
-		
-	msg -INFO [namespace current] put: "$url => ncode=$ncode, status=$status\n$response"
 	return $response
 }
 
