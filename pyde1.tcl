@@ -7,23 +7,25 @@
 ### By Enrique Bengoechea <enri.bengoechea@gmail.com> 
 ########################################################################################################################
 #set ::skindebug 1
-#plugins enable pyde1
-#fconfigure $::logging::_log_fh -buffering line
+plugins enable pyde1
+fconfigure $::logging::_log_fh -buffering line
 #dui config debug_buttons 1
 
 package require http
 package require tls
 package require json
+package require rest
 
 namespace eval ::plugins::pyde1 {
 	variable author "Enrique Bengoechea"
 	variable contact "enri.bengoechea@gmail.com"
 	variable version 0.1
 	variable github_repo ebengoechea/de1app_plugin_pyde1
-	variable name [translate "pyDE1 data"]
-	variable description [translate "Send profiles to pyDE1. Read shots from pyDE1."]
+	variable name "pyDE1"
+	variable description [translate "Communicate with pyDE1."]
 
 	variable min_de1app_version {1.37}
+	variable connected 0
 	
 	# References to GUI widgets 
 	variable widgets
@@ -38,8 +40,23 @@ proc ::plugins::pyde1::main {} {
 	msg "Starting the pyDE1 plugin"
 	check_versions
 
-	# Add GUI elements to the skin
+	# TODO: Add GUI integration to the skin
 	
+	# PRELIMINARY TESTING 
+	set v [request version]
+	if { [dict size $v] > 0 } {
+		msg -INFO [namespace current] "PLATFORM: [dict get $v platform]"
+	}
+	
+	# Upload a JSON profile for storage. Need to take it from a file as on the spot conversion to JSON not yet supported 
+	set profileTitle "Backflush cleaning"
+	set profileFile "[homedir]/profiles_v2/${profileTitle}.json"
+	
+	# NOTE: Curl profile upload uses headers: Accept */* Content-Type application/x-www-form-urlencoded and Content-Length with the size.
+	#	Doesn't seem required, though.
+	msg -INFO [namespace current] main: "PROFILE length: [string length $profileFile]"
+	
+	set putres [request de1/profile/store [read_binary_file $profileFile]]
 }
 
 # Paint settings screen
@@ -60,10 +77,10 @@ proc ::plugins::pyde1::preload {} {
 #	otherwise prevents startup.
 proc ::plugins::pyde1::check_versions {} {
 	if { [package vcompare [package version de1app] $::plugins::DYE::min_de1app_version] < 0 } {
-		message_page "[translate {Plugin 'pyDE1 data'}] v$::plugins::DYE::plugin_version [translate requires] \
+		message_page "[translate {Plugin 'pyDE1'}] v$::plugins::DYE::plugin_version [translate requires] \
 DE1app v$::plugins::DYE::min_de1app_version [translate {or higher}]\r\r[translate {Current DE1app version is}] [package version de1app]" \
 		[translate Ok]
-	}		
+	}
 }
 
 # Ensure all settings values are defined, otherwise set them to their default values.
@@ -74,6 +91,7 @@ proc ::plugins::pyde1::check_settings {} {
 	
 	ifexists settings(hostname) raspberrypi.local
 	ifexists settings(port) 1234
+	ifexists settings(use_https) 1
 }
 
 
@@ -84,16 +102,171 @@ proc ::plugins::pyde1::setup_default_aspects { args } {
 	
 }
 
-proc ::plugins::pyde1::put { payload } {
+# Using rest package 
+proc ::plugins::pyde1::rest { endpoint {query {}} {config {}} {body {}} } {
+	variable settings
+	if { $endpoint eq "" } {
+		msg -WARN [namespace current] get: "'endpoint' not specified"
+		return
+	}	
 	
+	if { [string is true $settings(use_https)] } {
+		set url "https://"
+	} else {
+		set url "http://"
+	}
+	append url "$settings(hostname):$settings(port)/$endpoint"
+
+	if { $config eq {} } {
+		set config {method get format json}
+	}
+	
+	set response ""
+	try {
+		set response [::rest::get $url $query $config $body]
+		set response [::rest::format_json $response]
+	} on error err {
+		msg -WARNING [namespace current] rest: "Error on REST request $url: $err"
+		dui say [translate "Request to pyDE1 failed"]
+		message_page "Error on REST request $url: $err" [translate Ok]
+	}
+	
+	msg -INFO [namespace current] rest: "$url => $response"
+	return $response
 }
 
-proc ::plugins::pyde1::patch { payload data } {
+# Using http package
+proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {body {}} } {
+	variable settings
+	if { $endpoint eq "" } {
+		msg -WARNING [namespace current] request: "'endpoint' not specified"
+		return
+	}	
+	if { $method ni {GET PUT PATCH} } {
+		msg -WARNING [namespace current] request: "'method' has to be one of GET, PUT or PATCH"
+		return
+	}
 	
+	if { [string is true $settings(use_https)] } {
+		set url "https://"
+	} else {
+		set url "http://"
+	}
+	append url "$settings(hostname):$settings(port)/$endpoint"
+	
+	try {
+		#::http::register https 443 [::tls::socket $settings(hostname) $settings(port)]
+		::http::register https 443 ::tls::socket
+	} on error err {
+		msg -ERROR [namespace current] request: "Can't register $settings(hostname):$settings(port) - $err: $err"
+		dui say [translate "Request to pyDE1 failed"]
+		
+		message_page "Can't register $settings(hostname):$settings(port) - $err" [translate Ok]
+		return
+	}
+	
+	set status ""
+	set answer ""
+	set code ""
+	set ncode ""
+	set response ""
+	try {
+		set token [::http::geturl $url -method $method -type "application/json" -query $query  -timeout 10000]
+		set status [::http::status $token]
+		set answer [::http::data $token]
+		set ncode [::http::ncode $token]
+		set code [::http::code $token]
+		::http::cleanup $token
+	} on error err {
+		msg -ERROR [namespace current] request: "Could not $method $url: $err"
+		dui say [translate "Request to pyDE1 failed"]
+		catch { ::http::cleanup $token }
+		
+		message_page "Could not $method $url: $err" [translate Ok]
+	}
+	
+	if { $status eq "ok" && $ncode == 200 } {
+		try {
+			set response [::json::json2dict $answer]
+		} on error err {
+			msg -WARNING [namespace current] request: "Can't parse JSON answer: $my_err\n$answer"
+			dui say [translate "Request to pyDE1 failed"]
+			
+			message_page "Can't parse JSON answer: $err" [translate Ok]
+		}
+	}
+		
+	msg -INFO [namespace current] request: "$url $method => ncode=$ncode, status=$status\n$response"
+	return $response
 }
 
-proc ::plugins::pyde1::put { payload data } {
+proc ::plugins::pyde1::patch { endpoint data } {
+	variable settings
+}
+
+proc ::plugins::pyde1::put { endpoint query } {
+	variable settings
+	if { $endpoint eq "" } {
+		msg -WARN [namespace current] get: "'endpoint' not specified"
+		return
+	}	
 	
+	if { [string is true $settings(use_https)] } {
+		set url "https://"
+	} else {
+		set url "http://"
+	}
+	append url "$settings(hostname):$settings(port)/$endpoint"
+	
+	try {
+		#::http::register https 443 [::tls::socket $settings(hostname) $settings(port)]
+		::http::register https 443 ::tls::socket
+	} on error err {
+		message_page "Can't register $settings(hostname):$settings(port) - $err" [translate Ok]
+		return
+	}
+	
+	set status ""
+	set answer ""
+	set code ""
+	set ncode ""
+	set response ""
+	try {
+		# application/x-www-form-urlencoded
+		# -headers [list Content-Length [string length $query]]
+		set token [::http::geturl $url -method PUT -type "application/json" -query "$query" -timeout 10000]
+		set status [::http::status $token]
+		set answer [::http::data $token]
+		set ncode [::http::ncode $token]
+		set code [::http::code $token]
+	} on error err {
+		msg -WARNING [namespace current] put: "Could not put to $url: $err"
+		dui say [translate "Request to pyDE1 failed"]
+		catch { ::http::cleanup $token }
+		
+		message_page "Could not put to $url: $err" [translate Ok]
+	}
+	
+	try {
+		::http::cleanup $token
+	}
+
+	
+	if { $status eq "ok" && $ncode == 200 } {
+		try {
+			set response [::json::json2dict $answer]
+		} on error err {
+			msg -WARNING [namespace current] put: "Can't parse JSON answer: $my_err\n$answer"
+			dui say [translate "Request to pyDE1 failed"]
+			
+			message_page "Can't parse JSON answer: $err" [translate Ok]
+		}
+	} else {
+		msg -INFO [namespace current] put: "$url => ncode=$ncode, status=$status\n$response,\nanswer=$answer"
+	}
+		
+	msg -INFO [namespace current] put: "$url => ncode=$ncode, status=$status\n$response"
+	return $response
 }
 
 
