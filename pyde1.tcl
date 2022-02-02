@@ -7,7 +7,7 @@
 ### By Enrique Bengoechea <enri.bengoechea@gmail.com> 
 ########################################################################################################################
 #set ::skindebug 1
-#plugins enable pyde1
+plugins enable pyde1
 #fconfigure $::logging::_log_fh -buffering line
 #dui config debug_buttons 1
 
@@ -42,21 +42,19 @@ proc ::plugins::pyde1::main {} {
 
 	# TODO: Add GUI integration to the skin
 	
-	# PRELIMINARY TESTING 
+	# PRELIMINARY TESTING: Check version 
 	set v [request version]
 	if { [dict size $v] > 0 } {
 		msg -INFO [namespace current] "PLATFORM: [dict get $v platform]"
 	}
 	
-	# Upload a JSON profile for storage. Need to take it from a file as on the spot conversion to JSON not yet supported 
-	set profileTitle "Backflush cleaning"
-	set profileFile "[homedir]/profiles_v2/${profileTitle}.json"
-	
-	# NOTE: Curl profile upload uses headers: Accept */* Content-Type application/x-www-form-urlencoded and Content-Length with the size.
-	#	Doesn't seem required, though.
-	msg -INFO [namespace current] main: "PROFILE length: [string length $profileFile]"
-	
-	set putres [request de1/profile/store [read_binary_file $profileFile]]
+	# Upload a JSON profile from disk for storage. Need to take it from a file as on the spot conversion to JSON not yet supported 
+#	set profileTitle "Backflush cleaning"
+#	set profileFile "[homedir]/profiles_v2/${profileTitle}.json"	
+#	set putres [request de1/profile/store PUT [read_binary_file $profileFile]]
+
+	# Test shot synchronization via Visualizer
+	visualizer_sync_history 1
 }
 
 # Paint settings screen
@@ -135,7 +133,8 @@ proc ::plugins::pyde1::rest { endpoint {query {}} {config {}} {body {}} } {
 	return $response
 }
 
-# Using http package
+# Using http package gives finer control than using the rest package.
+# If successful, returns a dictionary with the parsed JSON response. If it fails, returns an empty string.
 proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {body {}} } {
 	variable settings
 	if { $endpoint eq "" } {
@@ -170,8 +169,12 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 	set code ""
 	set ncode ""
 	set response ""
+	
+	# NOTE: Curl profile upload uses headers: Accept */* Content-Type application/x-www-form-urlencoded and Content-Length with the size.
+	#	Doesn't seem required, though.
+	# msg -INFO [namespace current] main: "PROFILE length: [string length $profileFile]"		
 	try {
-		set token [::http::geturl $url -method $method -type "application/json" -query $query  -timeout 10000]
+		set token [::http::geturl $url -method $method -type "application/json" -query $query -timeout 10000]
 		set status [::http::status $token]
 		set answer [::http::data $token]
 		set ncode [::http::ncode $token]
@@ -200,6 +203,138 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 	return $response
 }
 
+# Transform the current profile (on memory, on the global settings) to JSON format and submit it to pyDE1 for storage
+proc ::plugins::pyde1::profile_store_current {} {
+	::profile::sync_from_legacy
+	set putrest [request de1/profile/store PUT [huddle jsondump $::profile::current]]
+	return $putrest
+}
+
+# Reads the list of the last $items shots from Visualizer and imports those shots that were not done with the DE1 as 
+# local shots into the history (.shot files), and into the shots database if the SDB plugin is enabled.
+proc ::plugins::pyde1::visualizer_sync_history { {items 10} {propagate {}} } {
+	if { ![plugins enabled visualizer_upload] || ![plugins enabled SDB]} {
+		msg -WARNING [namespace current] sync_history: "needs visualizer_upload and SDB plugins enabled"
+		return
+	} 		
+	if { ![::plugins::visualizer_upload::has_credentials] } {
+		msg -WARNING [namespace current] sync_history: "visualizer username or password is not defined"
+		return
+	}
+
+	if { $propagate eq {} } {
+		# If propagation is not specified, use whatever is configured in DYE
+		if { [plugins enabled DYE] } {
+			set propagate $::plugins::DYE::settings(propagate_previous_shot_desc)
+			if { [info exists ::plugins::DYE::settings(reset_next_plan)] } {
+				set propagate [expr {$propagate && !$::plugins::DYE::settings(reset_next_plan)}]
+			}
+		} else {
+			set propagate 0
+		}
+	}
+	
+	# Download shot list
+	set shot_list [::plugins::visualizer_upload::download_shot_list 1 $items]
+	if { $shot_list eq {} } {
+		msg -WARNING [namespace current] visualizer_sync_history: "no shots returned from visualizer"
+		return
+	} else {
+		set shot_list [dict get $shot_list data]
+		if { [llength $shot_list] == 0 } {
+			msg -WARNING [namespace current] visualizer_sync_history: "no shots returned from visualizer"
+			return
+		}
+	}
+	
+	foreach shot_item $shot_list {
+		set shot_clock [lindex $shot_item 1]
+		set shot_id [lindex $shot_item 3]
+		
+		set existing_clock [::plugins::SDB::shots clock 0 "clock=$shot_clock" 1]
+		if { $existing_clock ne {} } {
+			msg -INFO [namespace current] visualizer_sync_history: "shot '$shot_clock' is already in the history"
+			continue
+		} 
+	
+		# Download shot and profile
+		set shot [::plugins::visualizer_upload::download $shot_id all]
+		set filename "[homedir]/history/[clock format $shot_clock -format $::plugins::SDB::filename_clock_format].shot"
+		if { [file exists $filename] } {
+			msg -WARNING [namespace current] visualizer_sync_history: "shot '$shot_clock' filename '$filename' already exists"
+			continue			
+		}
+		
+		set profile {}
+		if { [dict exists $shot profile_url] } {
+			set profile [::plugins::visualizer_upload::download_profile [dict get $shot profile_url]]
+		}
+
+		# Propagate descriptive data from the previous shot
+		if { [string is true $propagate] } {
+			msg -INFO "PROPAGATING"
+			set desc_cols [metadata fields -domain shot -category description -propagate 1]
+			array set prev_shot [::plugins::SDB::previous_shot $shot_clock $desc_cols]
+			msg -INFO "PREVIOUS SHOT: [array get prev_shot]"
+			if { [array size prev_shot] > 0 } {
+				foreach key $desc_cols {
+					if { [dict exists $shot $key] } {
+						if { $prev_shot($key) ne {} && [dict get $shot $key] eq {} } {
+							msg -INFO "PROPAGATING $key = $prev_shot($key)"
+							dict set shot $key $prev_shot($key)
+						}
+					} else {
+						msg -INFO "PROPAGATING $key = $prev_shot($key)"
+						dict set shot $key $prev_shot($key)
+					}
+				}
+			}
+		}
+		
+		# Create the .shot file
+		set espresso_data ""
+		append espresso_data "clock $shot_clock\n"
+		append espresso_data "local_time {[dict get $shot start_time]}\n"
+		append espresso_data "espresso_elapsed \{[dict get $shot timeframe]\}\n"
+		
+		set series [dict get $shot data]
+		foreach {key ts} $series {
+			append espresso_data "$key \{$ts\}\n"
+		}
+		append espresso_data "settings \{\n\tskin pyDE1\n"
+		
+		foreach key [dict keys $shot] {
+			if { $key ni {id user_id start_time timeframe data duration image_preview profile_url} } {
+				set v [dict get $shot $key]
+				if { $v eq "null" } {
+					set v {}
+				}
+				append espresso_data [subst {\t[list $key] [list $v]\n}]
+			}
+		}
+		
+		if { $profile ne {} } {
+			foreach key [dict keys $profile] {
+				if { $key ni {profile_title} } {
+					set v [dict get $profile $key]
+					if { $v eq "null" } {
+						set v {}
+					}
+					append espresso_data [subst {\t[list $key] [list $v]\n}]
+				}
+			}
+		}
+		
+		append espresso_data "\}\nmachine \{\n\}"
+
+		write_file $filename $espresso_data
+		msg -NOTICE [namespace current] visualizer_sync_history: "Saved visualizer shot '$shot_clock' to history: $filename"
+
+		# Persist the shot to the database
+		array set read_shot [::plugins::SDB::load_shot $filename]
+		::plugins::SDB::persist_shot read_shot
+	}
+}
 
 #### "CONFIGURATION SETTINGS" PAGE ######################################################################################
 
