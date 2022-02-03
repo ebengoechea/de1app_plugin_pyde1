@@ -47,19 +47,12 @@ proc ::plugins::pyde1::main {} {
 
 	# TODO: Add GUI integration to the skin
 	
-	# PRELIMINARY TESTING: Check version 
-	set v [request version]
-	if { [dict size $v] > 0 } {
-		msg -INFO [namespace current] "PLATFORM: [dict get $v platform]"
-	}
-	
 	# Upload a JSON profile from disk for storage. Need to take it from a file as on the spot conversion to JSON not yet supported 
 #	set profileTitle "Backflush cleaning"
 #	set profileFile "[homedir]/profiles_v2/${profileTitle}.json"
 	#set upload_result [request de1/profile/store PUT [read_binary_file $profileFile]]
 	
-	# Test shot synchronization via Visualizer
-	visualizer_sync_history 1
+	
 }
 
 # Paint settings screen
@@ -95,6 +88,7 @@ proc ::plugins::pyde1::check_settings {} {
 	ifexists settings(hostname) raspberrypi.local
 	ifexists settings(port) 1234
 	ifexists settings(use_https) 1
+	ifexists settings(n_sync_shots) 10
 }
 
 
@@ -243,7 +237,7 @@ proc ::plugins::pyde1::profile_store_current {} {
 	set putrest [request de1/profile/store PUT [huddle jsondump $::profile::current]]
 	
 	if { $last_request_success } {
-		set last_request_result [translate {"Profile successfully sent"}]
+		set last_request_result [translate "Profile '$::settings(profile_title)' successfully submitted"]
 	}
 	
 	return $putrest
@@ -251,7 +245,11 @@ proc ::plugins::pyde1::profile_store_current {} {
 
 # Reads the list of the last $items shots from Visualizer and imports those shots that were not done with the DE1 as 
 # local shots into the history (.shot files), and into the shots database if the SDB plugin is enabled.
-proc ::plugins::pyde1::visualizer_sync_history { {items 10} {propagate {}} } {
+# Returns a list with the clocks of the imported shots.
+proc ::plugins::pyde1::visualizer_sync_history { {items {}} {propagate {}} } {
+	variable settings
+	set synched {}
+	
 	if { ![plugins enabled visualizer_upload] || ![plugins enabled SDB]} {
 		msg -WARNING [namespace current] sync_history: "needs visualizer_upload and SDB plugins enabled"
 		return
@@ -261,6 +259,10 @@ proc ::plugins::pyde1::visualizer_sync_history { {items 10} {propagate {}} } {
 		return
 	}
 
+	if { $items eq {} || ![string is integer items] } {
+		set items $settings(n_sync_shots) 
+	}
+	
 	if { $propagate eq {} } {
 		# If propagation is not specified, use whatever is configured in DYE
 		if { [plugins enabled DYE] } {
@@ -372,8 +374,11 @@ proc ::plugins::pyde1::visualizer_sync_history { {items 10} {propagate {}} } {
 		# Persist the shot to the database
 		array set read_shot [::plugins::SDB::load_shot $filename]
 		::plugins::SDB::persist_shot read_shot
+		lappend synched $shot_clock
 		msg -NOTICE [namespace current] visualizer_sync_history: "Visualizer shot '$shot_clock' persisted to SDB database"
 	}
+	
+	return $synched
 }
 
 #### "CONFIGURATION SETTINGS" PAGE ######################################################################################
@@ -386,6 +391,8 @@ namespace eval ::plugins::pyde1::pyde1_settings {
 	array set data {
 		profile_title {}
 		profile_upload_result {}
+		test_pyde1_result {}
+		sync_history_result {}
 	}
 }
 
@@ -395,16 +402,20 @@ proc ::plugins::pyde1::pyde1_settings::setup {} {
 	set page [namespace tail [namespace current]]
 
 	# HEADER AND BACKGROUND
-	dui add dtext $page 1280 100 -tags page_title -text [translate "pyDE1 Plugin Settings"] -style page_title
+	dui add dtext $page 1280 100 -tags page_title -text [translate "pyDE1 Plugin"] -style page_title
 
 	dui add canvas_item rect $page 10 190 2550 1430 -fill "#ededfa" -width 0
 	dui add canvas_item line $page 14 188 2552 189 -fill "#c7c9d5" -width 2
 	dui add canvas_item line $page 2551 188 2552 1426 -fill "#c7c9d5" -width 2
 	
-	dui add canvas_item rect $page 22 210 1270 1410 -fill white -width 0
+#	dui add canvas_item rect $page 22 210 1270 1410 -fill white -width 0
+#	dui add canvas_item rect $page 1290 210 2536 850 -fill white -width 0	
+#	dui add canvas_item rect $page 1290 870 2536 1410 -fill white -width 0
+	dui add canvas_item rect $page 22 210 1270 750 -fill white -width 0
+	dui add canvas_item rect $page 22 770 1270 1410 -fill white -width 0
 	dui add canvas_item rect $page 1290 210 2536 850 -fill white -width 0	
 	dui add canvas_item rect $page 1290 870 2536 1410 -fill white -width 0
-		
+			
 	# LEFT SIDE 1, CONNECTIONS
 	set x 75; set y 250; set vspace 150; set lwidth 1050
 	set panel_width 1248
@@ -425,100 +436,43 @@ proc ::plugins::pyde1::pyde1_settings::setup {} {
 		-width 300 -text [translate "Use https?"]
 	dui add dtoggle $page [expr {$x+$panel_width-260}] $y -anchor ne -tags use_https \
 		-variable ::plugins::pyde1::settings(use_https) -command [list ::plugins::save_settings pyde1] 
-		
+
+	dui add dbutton $page $x [incr y 100] -anchor nw -tags test_pyde1 -style dsx_settings -bwidth 600 -bheight 150 \
+		-command test_pyde1 -label [translate "Test connection"] -label_width 425 -symbol house-signal
+	
+	dui add variable $page [expr {$x+625}] $y -tags test_pyde1_result -width [expr {$panel_width-725}] -font_size -2
+	
 	# LEFT SIDE 2, PROFILES
-	dui add dtext $page $x [incr y 175] -text [translate "Profiles"] -style section_header
+	dui add dtext $page $x [incr y 250] -text [translate "Profiles"] -style section_header
 	
 	dui add variable $page $x [incr y 100] -tags profile_title -width [expr {$panel_width-150}]
 	
-	dui add dbutton $page $x [incr y 100] -anchor nw -tags upload_profile -style dsx_settings -bwidth 800 \
-		-command upload_profile -label [translate "Send current profile to pyDE1"] -label_width 600 -symbol file-export
+	dui add dbutton $page $x [incr y 80] -anchor nw -tags upload_profile -style dsx_settings -bwidth 600 -bheight 150 \
+		-command upload_profile -label [translate "Submit current profile"] -label_width 425 -symbol file-export
 
-	dui add variable $page $x [incr y 225] -tags profile_upload_result -width [expr {$panel_width-150}]
+	dui add variable $page [expr {$x+625}] $y -tags profile_upload_result -width [expr {$panel_width-725}] -font_size -2
+	
+	dui add dbutton $page $x [incr y 225] -anchor nw -tags upload_visible_profiles -style dsx_settings -bwidth 600 -bheight 150 \
+		-command upload_visible_profiles -label [translate "Submit visible profiles"] -label_width 425 -symbol file-export
 
-		
-#	dui add dtext $page $x [incr y 100] -tags {propagate_previous_shot_desc_lbl propagate_previous_shot_desc*} \
-#		-width [expr {$panel_width-250}] -text [translate "Propagate Beans, Equipment, Ratio & People from last to next shot"]
-#	dui add dtoggle $page [expr {$x+$panel_width-100}] $y -anchor ne -tags propagate_previous_shot_desc \
-#		-variable ::plugins::DYE::settings(propagate_previous_shot_desc) -command propagate_previous_shot_desc_change 
-#	
-#	dui add dtext $page [expr {$x+150}] [incr y $vspace] -tags {reset_next_plan_lbl reset_next_plan*} \
-#		-width [expr {$panel_width-400}] -text [translate "Reset next plan after pulling a shot"] -initial_state disabled
-#	dui add dtoggle $page [expr {$x+$panel_width-100}] $y -anchor ne -tags reset_next_plan \
-#		-variable ::plugins::DYE::settings(reset_next_plan) -command reset_next_plan_change -initial_state disabled
-#	
-#	dui add dtext $page $x [incr y $vspace] -tags {describe_from_sleep_lbl describe_from_sleep*} \
-#		-width [expr {$panel_width-250}] -text [translate "Icon on screensaver to describe last shot without waking up the DE1"]
-#	dui add dtoggle $page [expr {$x+$panel_width-100}] $y -anchor ne -tags describe_from_sleep \
-#		-variable ::plugins::DYE::settings(describe_from_sleep) -command describe_from_sleep_change 
-#	
-##	dui add dtext $page $x [incr y $vspace] -tags {backup_modified_shot_files_lbl backup_modified_shot_files*} \
-##		-width [expr {$panel_width-250}] -text [translate "Backup past shot files when they are modified (.bak extension)"]
-##	dui add dtoggle $page [expr {$x+$panel_width-100}] $y -anchor ne -tags backup_modified_shot_files \
-##		-variable ::plugins::DYE::settings(backup_modified_shot_files) -command backup_modified_shot_files_change 
-#
-#	dui add dtext $page $x [incr y $vspace] -tags {use_stars_to_rate_enjoyment_lbl use_stars_to_rate_enjoyment*} \
-#		-width [expr {$panel_width-700}] -text [translate "Rate enjoyment using"]
-#	dui add dselector $page [expr {$x+$panel_width-100}] $y -bwidth 600 -anchor ne -tags use_stars_to_rate_enjoyment \
-#		-variable ::plugins::DYE::settings(use_stars_to_rate_enjoyment) -values {1 0} \
-#		-labels [list [translate {0-5 stars}] [translate {0-100 slider}]] -command [list ::plugins::save_settings DYE]
-#
-#	dui add dtext $page $x [incr y $vspace] -tags {relative_dates_lbl relative_dates*} \
-#		-width [expr {$panel_width-700}] -text [translate "Format of shot dates in DYE pages"]
-#	dui add dselector $page [expr {$x+$panel_width-100}] $y -bwidth 600 -anchor ne -tags relative_dates \
-#		-variable ::plugins::DYE::settings(relative_dates) -values {1 0} \
-#		-labels [list [translate Relative] [translate Absolute]] -command [list ::plugins::save_settings DYE]
-#
-#	dui add dtext $page $x [incr y $vspace] -tags {date_input_format_lbl date_input_format*} \
-#		-width [expr {$panel_width-700}] -text [translate "Input dates format"]
-#	dui add dselector $page [expr {$x+$panel_width-100}] $y -bwidth 600 -anchor ne -tags date_input_format \
-#		-variable ::plugins::DYE::settings(date_input_format) -values {MDY DMY YMD} \
-#		-labels [list [translate MDY] [translate DMY] [translate YMD]] -command [list [namespace current]::roast_date_format_change]
-#
-#	dui add entry $page [expr {$x+$panel_width-100}] [incr y $vspace] -width 12 -canvas_anchor ne -tags roast_date_format \
-#		-textvariable ::plugins::DYE::settings(roast_date_format) -vcmd {return [expr {[string len %P]<=15}]} -justify right \
-#		-label [translate "Roast date format"] -label_pos [list $x $y]
-#	bind $widgets(roast_date_format) <Leave> [list + [namespace current]::roast_date_format_change]
-#	
-#	dui add variable $page [expr {$x+$panel_width-450}] $y -width 300 -anchor ne -justify right -tags roast_date_example \
-#		-fill [dui aspect get dselector selectedfill -theme default]
-#	
-#	# RIGHT SIDE, TOP
-#	set x 1350; set y 250
-#	dui add dtext $page $x $y -text [translate "DSx skin options"] -style section_header
-#	
-#	dui add dtext $page $x [incr y 100] -tags {show_shot_desc_on_home_lbl show_shot_desc_on_home*} \
-#		-width [expr {$panel_width-375}] -text [translate "Show next & last shot description summaries on DSx home page"]
-#	dui add dtoggle $page [expr {$x+$panel_width-100}] $y -anchor ne -tags show_shot_desc_on_home \
-#		-variable ::plugins::DYE::settings(show_shot_desc_on_home) -command show_shot_desc_on_home_change 
-#	
-#	incr y [expr {int($vspace * 1.40)}]
-#	
-#	dui add dtext $page $x $y -tags shot_desc_font_color_label -width 725 -text [translate "Color of shot descriptions summaries"]
-#
-#	dui add dbutton $page [expr {$x+$panel_width-100}] $y -anchor ne -tags shot_desc_font_color -style dsx_settings \
-#		-command shot_desc_font_color_change -label [translate "Change color"] -label_width 250 \
-#		-symbol paint-brush -symbol_fill $::plugins::DYE::settings(shot_desc_font_color)
-#
-#	dui add dbutton $page [expr {$x+700}] [expr {$y+[dui aspect get dbutton bheight -style dsx_settings]}] \
-#		-bwidth 425 -bheight 100 -anchor se -tags use_default_color \
-#		-shape outline -outline $::plugins::DYE::default_shot_desc_font_color -arc_offset 35 \
-#		-label [translate {Use default color}] -label_fill $::plugins::DYE::default_shot_desc_font_color \
-#		-label_font_size -1 -command set_default_shot_desc_font_color 
-#
-#	# RIGHT SIDE, BOTTOM
-#	set y 925
-#	dui add dtext $page $x $y -text [translate "Insight / MimojaCafe skin options"] -style section_header
-#	
-#	dui add dtext $page $x [incr y 100] -tags default_launch_action_label -width 725 \
-#		-text [translate "Default action when DYE icon or button is tapped"]
-#	
-#	dui add dselector $page [expr {$x+$panel_width-100}] $y -bwidth 400 -bheight 271 -orient v -anchor ne -values {last next dialog} \
-#		-variable ::plugins::DYE::settings(default_launch_action) -labels {"Describe last" "Plan next" "Launch dialog"} \
-#		-command [list ::plugins::save_settings DYE]
+	# RIGHT SIDE 1, SHOTS	
+	set x 1350; set y 250
+	dui add dtext $page $x $y -text [translate "Shot history"] -style section_header
+	
+	dui add entry $page [expr {$x+600}] [incr y 100] -width 4 -canvas_anchor nw -tags n_sync_shots \
+		-textvariable ::plugins::pyde1::settings(n_sync_shots) \
+		-label [translate "Number of shots to check"] -label_pos [list $x $y] -label_width 580
+	bind $widgets(n_sync_shots) <Return> [list ::plugins::save_settings pyde1]	
+
+	dui add dbutton $page $x [incr y 150] -anchor nw -tags visualizer_sync_history -style dsx_settings -bwidth 600 -bheight 150 \
+		-command visualizer_sync_history -label [translate "Import shots using Visualizer"] -label_width 425 -symbol file-import
+
+	dui add variable $page [expr {$x+625}] $y -tags sync_history_result -width [expr {$panel_width-725}] -font_size -2
+	
 	
 	# FOOTER
 	dui add dbutton $page 1035 1460 -tags page_done -style insight_ok -command page_done -label [translate Ok]
+	
 }
 
 proc ::plugins::pyde1::pyde1_settings::load { page_to_hide page_to_show args } {
@@ -537,20 +491,60 @@ proc ::plugins::pyde1::pyde1_settings::show { page_to_hide page_to_show } {
 	#dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
 }
 	
+proc ::plugins::pyde1::pyde1_settings::test_pyde1 {} {
+	variable data
+	set page [namespace tail [namespace current]]
+	
+	set data(test_pyde1_result) [translate "Testing..."]
+	dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
+
+	set ver [::plugins::pyde1::request version]
+	if { $::plugins::pyde1::last_request_success } {
+		if { [dict size $ver] > 0 } {
+			set data(test_pyde1_result) "Connected to pyDE1 v[dict get $ver module_versions pyDE1] running on [dict get $ver platform]"
+		} else {
+			dui item config $page test_pyde1_result -fill [dui aspect get dtext fill -theme [dui page theme $page] -style error]
+			set data(test_pyde1_result) [translate {ERROR: Empty version response}]
+		}
+	} else {
+		dui item config $page test_pyde1_result -fill [dui aspect get dtext fill -theme [dui page theme $page] -style error]
+		set data(test_pyde1_result) $::plugins::pyde1::last_request_result
+	}
+}
 
 proc ::plugins::pyde1::pyde1_settings::upload_profile {} {
 	variable data
 	set page [namespace tail [namespace current]]
 	
-	set data(profile_upload_result) [translate "Sending profile..."]
+	set data(profile_upload_result) [translate "Submitting profile..."]
 	dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
-	::dui::page::update_onscreen_variables
 	
 	set upload_result [::plugins::pyde1::profile_store_current]
 
 	set data(profile_upload_result) $::plugins::pyde1::last_request_result
 	if { !$::plugins::pyde1::last_request_success } {
 		dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page] -style error]
+	}
+}
+
+proc ::plugins::pyde1::pyde1_settings::visualizer_sync_history {} {
+	variable data
+	set page [namespace tail [namespace current]]
+	
+	set data(sync_history_result) [translate "Checking Visualizer shots not in local history..."]
+	dui item config $page sync_history_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
+	
+	set synched [::plugins::pyde1::visualizer_sync_history $::plugins::pyde1::settings(n_sync_shots)]
+	
+	if { $::plugins::pyde1::last_request_success } {
+		if { [llength $synched] == 0 } {
+			set data(sync_history_result) [translate {No shots needed importing}]
+		} else {
+			set data(sync_history_result) "[llength $synched] shots have been imported."
+		}
+	} else {
+		set data(sync_history_result) $::plugins::pyde1::last_request_result
+		dui item config $page sync_history_result -fill [dui aspect get dtext fill -theme [dui page theme $page] -style error]
 	}
 }
 
