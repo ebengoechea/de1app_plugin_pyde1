@@ -26,6 +26,11 @@ namespace eval ::plugins::pyde1 {
 
 	variable min_de1app_version {1.37}
 	variable connected 0
+
+	variable last_request {}
+	variable last_request_timestamp {}
+	variable last_request_success 0
+	variable last_request_result {}
 	
 	# References to GUI widgets 
 	variable widgets
@@ -50,9 +55,9 @@ proc ::plugins::pyde1::main {} {
 	
 	# Upload a JSON profile from disk for storage. Need to take it from a file as on the spot conversion to JSON not yet supported 
 #	set profileTitle "Backflush cleaning"
-#	set profileFile "[homedir]/profiles_v2/${profileTitle}.json"	
-#	set putres [request de1/profile/store PUT [read_binary_file $profileFile]]
-
+#	set profileFile "[homedir]/profiles_v2/${profileTitle}.json"
+	#set upload_result [request de1/profile/store PUT [read_binary_file $profileFile]]
+	
 	# Test shot synchronization via Visualizer
 	visualizer_sync_history 1
 }
@@ -66,7 +71,7 @@ proc ::plugins::pyde1::preload {} {
 	plugins save_settings pyde1
 	
 #	setup_default_aspects
-	dui page add pyde1_settings -namespace true -theme default -type fpdialog
+	dui page add pyde1_settings -namespace ::plugins::pyde1::pyde1_settings -theme default -type fpdialog
 	return pyde1_settings
 }
 
@@ -98,6 +103,18 @@ proc ::plugins::pyde1::check_settings {} {
 proc ::plugins::pyde1::setup_default_aspects { args } {
 	set theme default
 	
+}
+
+proc ::plugins::pyde1::reset_last_request { {request {}} } {
+	variable last_request
+	variable last_request_timestamp
+	variable last_request_success
+	variable last_request_result
+	
+	set last_request $last_request
+	set last_request_timestamp [clock seconds]
+	set last_request_success 0
+	set last_request_result {}
 }
 
 # Using rest package 
@@ -137,12 +154,18 @@ proc ::plugins::pyde1::rest { endpoint {query {}} {config {}} {body {}} } {
 # If successful, returns a dictionary with the parsed JSON response. If it fails, returns an empty string.
 proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {body {}} } {
 	variable settings
+	reset_last_request
+	variable last_request_success
+	variable last_request_result
+	
 	if { $endpoint eq "" } {
-		msg -WARNING [namespace current] request: "'endpoint' not specified"
+		set last_request_result "'endpoint' not specified"
+		msg -WARNING [namespace current] request: $last_request_result
 		return
 	}	
 	if { $method ni {GET PUT PATCH} } {
-		msg -WARNING [namespace current] request: "'method' has to be one of GET, PUT or PATCH"
+		set last_request_result "'method' has to be one of GET, PUT or PATCH"
+		msg -WARNING [namespace current] request: $last_request_result
 		return
 	}
 	
@@ -157,7 +180,8 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 		#::http::register https 443 [::tls::socket $settings(hostname) $settings(port)]
 		::http::register https 443 ::tls::socket
 	} on error err {
-		msg -ERROR [namespace current] request: "Can't register $settings(hostname):$settings(port) - $err: $err"
+		set last_request_result "Can't register $settings(hostname):$settings(port) - $err: $err"
+		msg -ERROR [namespace current] request: $last_request_result
 		dui say [translate "Request to pyDE1 failed"]
 		
 		#message_page "Can't register $settings(hostname):$settings(port) - $err" [translate Ok]
@@ -181,7 +205,8 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 		set code [::http::code $token]
 		::http::cleanup $token
 	} on error err {
-		msg -ERROR [namespace current] request: "Could not $method $url: $err"
+		set last_request_result "Could not $method $url: $err"
+		msg -ERROR [namespace current] request: $last_request_result
 		dui say [translate "Request to pyDE1 failed"]
 		catch { ::http::cleanup $token }
 		
@@ -192,21 +217,35 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 		try {
 			set response [::json::json2dict $answer]
 		} on error err {
-			msg -WARNING [namespace current] request: "Can't parse JSON answer: $my_err\n$answer"
+			set last_request_result "Can't parse JSON answer: $my_err\n$answer"
+			msg -WARNING [namespace current] request: $last_request_result
 			dui say [translate "Request to pyDE1 failed"]
 			
 			#message_page "Can't parse JSON answer: $err" [translate Ok]
 		}
 	}
 		
-	msg -INFO [namespace current] request: "$url $method => ncode=$ncode, status=$status\n$response"
+	#msg -INFO [namespace current] request: "$url $method => ncode=$ncode, status=$status\n$response"
+	if { $last_request_result eq {} } {
+		set last_request_success 1
+		set last_request_result [translate {Request successful}]
+	}
+	
 	return $response
 }
 
 # Transform the current profile (on memory, on the global settings) to JSON format and submit it to pyDE1 for storage
 proc ::plugins::pyde1::profile_store_current {} {
+	variable last_request_success
+	variable last_request_result
+	
 	::profile::sync_from_legacy
 	set putrest [request de1/profile/store PUT [huddle jsondump $::profile::current]]
+	
+	if { $last_request_success } {
+		set last_request_result [translate {"Profile successfully sent"}]
+	}
+	
 	return $putrest
 }
 
@@ -262,7 +301,7 @@ proc ::plugins::pyde1::visualizer_sync_history { {items 10} {propagate {}} } {
 		set filename "[homedir]/history/[clock format $shot_clock -format $::plugins::SDB::filename_clock_format].shot"
 		if { [file exists $filename] } {
 			msg -WARNING [namespace current] visualizer_sync_history: "shot '$shot_clock' filename '$filename' already exists"
-			continue			
+			continue
 		}
 		
 		set profile {}
@@ -272,24 +311,24 @@ proc ::plugins::pyde1::visualizer_sync_history { {items 10} {propagate {}} } {
 
 		# Propagate descriptive data from the previous shot
 		if { [string is true $propagate] } {
-			msg -INFO "PROPAGATING"
 			set desc_cols [metadata fields -domain shot -category description -propagate 1]
 			array set prev_shot [::plugins::SDB::previous_shot $shot_clock $desc_cols]
-			msg -INFO "PREVIOUS SHOT: [array get prev_shot]"
 			if { [array size prev_shot] > 0 } {
 				foreach key $desc_cols {
 					if { [dict exists $shot $key] } {
 						if { $prev_shot($key) ne {} && [dict get $shot $key] eq {} } {
-							msg -INFO "PROPAGATING $key = $prev_shot($key)"
+							#msg -INFO [namespace current] visualizer_sync_history: "propagating $key = $prev_shot($key)"
 							dict set shot $key $prev_shot($key)
 						}
 					} else {
-						msg -INFO "PROPAGATING $key = $prev_shot($key)"
+						#msg -INFO [namespace current] visualizer_sync_history: "propagating $key = $prev_shot($key)"
 						dict set shot $key $prev_shot($key)
 					}
 				}
 			}
 		}
+		
+		dict append shot espresso_notes "\nPulled with pyDE1."
 		
 		# Create the .shot file
 		set espresso_data ""
@@ -327,12 +366,13 @@ proc ::plugins::pyde1::visualizer_sync_history { {items 10} {propagate {}} } {
 		
 		append espresso_data "\}\nmachine \{\n\}"
 
-		write_file $filename $espresso_data
+		write_file $filename $espresso_data	
 		msg -NOTICE [namespace current] visualizer_sync_history: "Saved visualizer shot '$shot_clock' to history: $filename"
-
+		
 		# Persist the shot to the database
 		array set read_shot [::plugins::SDB::load_shot $filename]
 		::plugins::SDB::persist_shot read_shot
+		msg -NOTICE [namespace current] visualizer_sync_history: "Visualizer shot '$shot_clock' persisted to SDB database"
 	}
 }
 
@@ -344,7 +384,8 @@ namespace eval ::plugins::pyde1::pyde1_settings {
 	
 	variable data
 	array set data {
-		page_name "::plugins::pyde1::pyde1_settings"
+		profile_title {}
+		profile_upload_result {}
 	}
 }
 
@@ -354,7 +395,7 @@ proc ::plugins::pyde1::pyde1_settings::setup {} {
 	set page [namespace tail [namespace current]]
 
 	# HEADER AND BACKGROUND
-	dui add dtext $page 1280 100 -tags page_title -text [translate "pyDE1 Data Plugin Settings"] -style page_title
+	dui add dtext $page 1280 100 -tags page_title -text [translate "pyDE1 Plugin Settings"] -style page_title
 
 	dui add canvas_item rect $page 10 190 2550 1430 -fill "#ededfa" -width 0
 	dui add canvas_item line $page 14 188 2552 189 -fill "#c7c9d5" -width 2
@@ -364,12 +405,38 @@ proc ::plugins::pyde1::pyde1_settings::setup {} {
 	dui add canvas_item rect $page 1290 210 2536 850 -fill white -width 0	
 	dui add canvas_item rect $page 1290 870 2536 1410 -fill white -width 0
 		
-	# LEFT SIDE
+	# LEFT SIDE 1, CONNECTIONS
 	set x 75; set y 250; set vspace 150; set lwidth 1050
 	set panel_width 1248
 	
-#	dui add dtext $page $x $y -text [translate "General options"] -style section_header
-#		
+	dui add dtext $page $x $y -text [translate "Connection"] -style section_header
+
+	dui add entry $page [expr {$x+225}] [incr y 100] -width 34 -canvas_anchor nw -tags hostname \
+		-textvariable ::plugins::pyde1::settings(hostname) \
+		-label [translate "Hostname"] -label_pos [list $x $y] -label_width 300
+	bind $widgets(hostname) <Return> [list ::plugins::save_settings pyde1]	
+
+	dui add entry $page [expr {$x+225}] [incr y 100] -width 6 -canvas_anchor nw -tags port \
+		-textvariable ::plugins::pyde1::settings(port) \
+		-label [translate "Port"] -label_pos [list $x $y] -label_width 300
+	bind $widgets(port) <Return> [list ::plugins::save_settings pyde1]	
+	
+	dui add dtext $page [expr {$x+600}] $y -tags {use_https_lbl use_https*} \
+		-width 300 -text [translate "Use https?"]
+	dui add dtoggle $page [expr {$x+$panel_width-260}] $y -anchor ne -tags use_https \
+		-variable ::plugins::pyde1::settings(use_https) -command [list ::plugins::save_settings pyde1] 
+		
+	# LEFT SIDE 2, PROFILES
+	dui add dtext $page $x [incr y 175] -text [translate "Profiles"] -style section_header
+	
+	dui add variable $page $x [incr y 100] -tags profile_title -width [expr {$panel_width-150}]
+	
+	dui add dbutton $page $x [incr y 100] -anchor nw -tags upload_profile -style dsx_settings -bwidth 800 \
+		-command upload_profile -label [translate "Send current profile to pyDE1"] -label_width 600 -symbol file-export
+
+	dui add variable $page $x [incr y 225] -tags profile_upload_result -width [expr {$panel_width-150}]
+
+		
 #	dui add dtext $page $x [incr y 100] -tags {propagate_previous_shot_desc_lbl propagate_previous_shot_desc*} \
 #		-width [expr {$panel_width-250}] -text [translate "Propagate Beans, Equipment, Ratio & People from last to next shot"]
 #	dui add dtoggle $page [expr {$x+$panel_width-100}] $y -anchor ne -tags propagate_previous_shot_desc \
@@ -459,8 +526,33 @@ proc ::plugins::pyde1::pyde1_settings::load { page_to_hide page_to_show args } {
 }
 
 proc ::plugins::pyde1::pyde1_settings::show { page_to_hide page_to_show } {
+	variable data
+	set page [namespace tail [namespace current]]
+	
+	set data(profile_title) "[translate {Current profile}]: $::settings(profile_title)"
+	if { [string is true $::settings(profile_has_changed)] } {
+		append data(profile_title) "* (modified)"
+	}
+	
+	#dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
 }
+	
 
+proc ::plugins::pyde1::pyde1_settings::upload_profile {} {
+	variable data
+	set page [namespace tail [namespace current]]
+	
+	set data(profile_upload_result) [translate "Sending profile..."]
+	dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
+	::dui::page::update_onscreen_variables
+	
+	set upload_result [::plugins::pyde1::profile_store_current]
+
+	set data(profile_upload_result) $::plugins::pyde1::last_request_result
+	if { !$::plugins::pyde1::last_request_success } {
+		dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page] -style error]
+	}
+}
 
 proc ::plugins::pyde1::pyde1_settings::page_done {} {
 	dui say [translate {Done}] button_in
