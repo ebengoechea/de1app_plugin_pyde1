@@ -14,7 +14,7 @@ plugins enable pyde1
 package require http
 package require tls
 package require json
-package require rest
+#package require rest
 
 namespace eval ::plugins::pyde1 {
 	variable author "Enrique Bengoechea"
@@ -45,7 +45,7 @@ proc ::plugins::pyde1::main {} {
 	msg "Starting the pyDE1 plugin"
 	check_versions
 
-	# TODO: Add GUI integration to the skin
+	# TODO: Add GUI integration to the skin ?
 	
 	# Upload a JSON profile from disk for storage. Need to take it from a file as on the spot conversion to JSON not yet supported 
 #	set profileTitle "Backflush cleaning"
@@ -111,38 +111,38 @@ proc ::plugins::pyde1::reset_last_request { {request {}} } {
 	set last_request_result {}
 }
 
-# Using rest package 
-proc ::plugins::pyde1::rest { endpoint {query {}} {config {}} {body {}} } {
-	variable settings
-	if { $endpoint eq "" } {
-		msg -WARN [namespace current] get: "'endpoint' not specified"
-		return
-	}	
-	
-	if { [string is true $settings(use_https)] } {
-		set url "https://"
-	} else {
-		set url "http://"
-	}
-	append url "$settings(hostname):$settings(port)/$endpoint"
-
-	if { $config eq {} } {
-		set config {method get format json}
-	}
-	
-	set response ""
-	try {
-		set response [::rest::get $url $query $config $body]
-		set response [::rest::format_json $response]
-	} on error err {
-		msg -WARNING [namespace current] rest: "Error on REST request $url: $err"
-		dui say [translate "Request to pyDE1 failed"]
-		#message_page "Error on REST request $url: $err" [translate Ok]
-	}
-	
-	msg -INFO [namespace current] rest: "$url => $response"
-	return $response
-}
+# Using rest package (not used!) 
+#proc ::plugins::pyde1::rest { endpoint {query {}} {config {}} {body {}} } {
+#	variable settings
+#	if { $endpoint eq "" } {
+#		msg -WARN [namespace current] get: "'endpoint' not specified"
+#		return
+#	}	
+#	
+#	if { [string is true $settings(use_https)] } {
+#		set url "https://"
+#	} else {
+#		set url "http://"
+#	}
+#	append url "$settings(hostname):$settings(port)/$endpoint"
+#
+#	if { $config eq {} } {
+#		set config {method get format json}
+#	}
+#	
+#	set response ""
+#	try {
+#		set response [::rest::get $url $query $config $body]
+#		set response [::rest::format_json $response]
+#	} on error err {
+#		msg -WARNING [namespace current] rest: "Error on REST request $url: $err"
+#		dui say [translate "Request to pyDE1 failed"]
+#		#message_page "Error on REST request $url: $err" [translate Ok]
+#	}
+#	
+#	msg -INFO [namespace current] rest: "$url => $response"
+#	return $response
+#}
 
 # Using http package gives finer control than using the rest package.
 # If successful, returns a dictionary with the parsed JSON response. If it fails, returns an empty string.
@@ -171,14 +171,16 @@ proc ::plugins::pyde1::request { endpoint {method GET} {query {}} {headers {}} {
 	append url "$settings(hostname):$settings(port)/$endpoint"
 	
 	try {
-		#::http::register https 443 [::tls::socket $settings(hostname) $settings(port)]
 		::http::register https 443 ::tls::socket
+		if { [string is true $settings(use_https)] } {
+			# -tls1 0 -ssl2 0 -ssl3 1 -tls1.1 0 -tls1.2 0 
+			::tls::init -servername $settings(hostname)
+		}
 	} on error err {
 		set last_request_result "Can't register $settings(hostname):$settings(port) - $err: $err"
 		msg -ERROR [namespace current] request: $last_request_result
 		dui say [translate "Request to pyDE1 failed"]
 		
-		#message_page "Can't register $settings(hostname):$settings(port) - $err" [translate Ok]
 		return
 	}
 	
@@ -241,6 +243,36 @@ proc ::plugins::pyde1::profile_store_current {} {
 	}
 	
 	return $putrest
+}
+
+# Transform the visible profiles to JSON format and submit each one to pyDE1 for storage
+proc ::plugins::pyde1::profile_store_visible {} {
+	variable last_request_success
+	variable last_request_result
+	set successProfiles {}
+	set failedProfiles {}
+	
+	array set profilesData [::profile::saved_profiles_list 0]
+	
+	set i 0
+	foreach fn $profilesData(path) {
+		if { ![string is true [lindex $profilesData(hide) $i]] } {
+			msg -INFO [namespace current] profile_store_visible: "reading '$fn'"
+			set profile [::profile::read_legacy profile_file $fn]
+			set profilev2 [::profile::legacy_profile_to_v2 $profile]
+			set putrest [request de1/profile/store PUT [huddle jsondump $profilev2]]
+			if { $last_request_success } {
+				msg -INFO [namespace current] profile_store_visible: "success uploading profile $fn"
+				lappend successProfiles [lindex $profilesData(title) $i]
+			} else {
+				msg -WARNING [namespace current] profile_store_visible: "fail to upload profile [lindex $profilesData(title) $i]"
+				lappend failedProfiles [lindex $profilesData(title) $i]
+			}
+		}
+		incr i
+	}
+	
+	return [list $successProfiles $failedProfiles]
 }
 
 # Reads the list of the last $items shots from Visualizer and imports those shots that were not done with the DE1 as 
@@ -496,7 +528,7 @@ proc ::plugins::pyde1::pyde1_settings::test_pyde1 {} {
 	set page [namespace tail [namespace current]]
 	
 	set data(test_pyde1_result) [translate "Testing..."]
-	dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
+	dui item config $page test_pyde1_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
 
 	set ver [::plugins::pyde1::request version]
 	if { $::plugins::pyde1::last_request_success } {
@@ -527,6 +559,44 @@ proc ::plugins::pyde1::pyde1_settings::upload_profile {} {
 	}
 }
 
+proc ::plugins::pyde1::pyde1_settings::upload_visible_profiles {} {
+	variable data
+	set page [namespace tail [namespace current]]
+	
+	set data(profile_upload_result) [translate "Submitting visible profiles..."]
+	dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page]]
+	
+	lassign [::plugins::pyde1::profile_store_visible] successProfiles failedProfiles
+
+	set msg ""
+	if { [llength $successProfiles] > 0 || [llength $failedProfiles] > 0 } {
+		if { [llength $successProfiles] > 0 } {
+			append msg "Uploaded "
+			foreach prof $successProfiles {
+				append msg "'${prof}', "
+			}
+			set msg [string range $msg 0 [expr {[string length $msg]-2}]]
+			append msg ".\n"
+		}
+		if { [llength $failedProfiles] > 0 } {
+			append msg "FAILED to upload "
+			foreach prof $successProfiles {
+				append msg "'${prof}', "
+			}
+			set msg [string range $msg 0 [expr {[string length $msg]-2}]]
+			append msg ".\n"
+		}		
+	} else {
+		set msg "No profile has been uploaded."
+	}
+	
+	set data(profile_upload_result) $msg
+		
+	if { [llength $failedProfiles] > 0 } {
+		dui item config $page profile_upload_result -fill [dui aspect get dtext fill -theme [dui page theme $page] -style error]
+	}
+}
+
 proc ::plugins::pyde1::pyde1_settings::visualizer_sync_history {} {
 	variable data
 	set page [namespace tail [namespace current]]
@@ -553,3 +623,85 @@ proc ::plugins::pyde1::pyde1_settings::page_done {} {
 	dui page close_dialog
 }
 
+
+# TBD: Make a PR to move this to profile.tcl!! (also copied on DYE!!)
+# Returns a list of key-value pairs (which can be casted to an array) with keys 'filename', 'path', 'title', 'group', 'author',
+#	'hide', 'type', 'bev_type', and, if argument $file_stats is 1, also 'ctime' and 'mtime'. 
+# Each value is a list of equal length.
+proc ::profile::saved_profiles_list { {file_stats 1} } {
+	set file_stats [string is true $file_stats]
+	set files [lsort -dictionary [glob -nocomplain -directory "[homedir]/profiles/" *.tcl]]
+	
+	set filename {}
+	set fullpath {}
+	set title {}
+	set group {}
+	set hide {}
+	set type {}
+	set bev_type {}
+	set ctime {}
+	set mtime {}
+	
+	foreach fn $files {
+		unset -nocomplain profile
+		try {
+			array set profile [encoding convertfrom utf-8 [read_binary_file $fn]]
+		} on error err {
+			msg -ERROR [namespace current] list:: "can't read profile file '$fn': $err"
+			continue
+		}
+		
+		set rootname [file tail [file rootname $fn]]
+		if { $rootname eq "CVS" || $rootname eq "example" } {
+			continue
+		}		
+		
+		if { ![info exists profile(profile_title)] } {
+			msg -ERROR [namespace current] list:: "corrupt profile file '$fn': $err"
+			continue
+		}
+		
+		lappend filename $rootname
+		lappend fullpath "$fn"
+		lappend title $profile(profile_title)
+		
+		set parts [split $profile(profile_title) /]
+		if {[llength $parts] > 1} {
+			lappend group [lindex $parts 0]
+		} else {
+			lappend group ""
+		}
+		
+		lappend hide [value_or_default profile(profile_hide) 0]
+		lappend type [fix_profile_type [value_or_default profile(settings_profile_type) {}]]
+		# Found some profiles like "beverage_type {pourover}" and "beverage_type 0", so we explicitly handle those cases 
+		set this_bev_type [value_or_default [lindex profile(beverage_type) 0] {}]
+		if { $this_bev_type == 0 } {
+			set this_bev_type ""
+		}
+		lappend bev_type $this_bev_type
+		lappend author [value_or_default profile(author) {}]
+		
+		if { $file_stats } {
+			file stat $fn fstats
+			lappend ctime $fstats(ctime)
+			lappend mtime $fstats(mtime)
+		}
+	}
+	
+	set result [list \
+		filename $filename \
+		path $fullpath \
+		title $title \
+		group $group \
+		author $author \
+		hide $hide \
+		type $type \
+		bev_type $bev_type
+	]
+	if { $file_stats } {
+		lappend result ctime $ctime mtime $mtime
+	}
+	
+	return $result
+}
